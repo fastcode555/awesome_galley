@@ -93,7 +93,12 @@ class _WaterfallViewState extends State<WaterfallView> {
       ),
       body: Consumer<GalleryController>(
         builder: (context, controller, _) {
-          if (controller.images.isEmpty && controller.isLoading) {
+          final isFolderModeActive = widget.overrideImages != null && !_showSystemImages;
+          final targetEmpty = isFolderModeActive
+              ? controller.folderImages.isEmpty
+              : controller.images.isEmpty;
+
+          if (targetEmpty && controller.isLoading) {
             return const UnifiedLoadingIndicator(
               message: 'Loading images...',
               size: LoadingSize.large,
@@ -110,8 +115,10 @@ class _WaterfallViewState extends State<WaterfallView> {
           }
 
           // overrideImages 优先（open with 文件夹模式），但可被 _showSystemImages 覆盖
+          // 注意：直接用 controller.folderImages 而不是 widget.overrideImages，
+          // 这样删除后 notifyListeners 能直接驱动 UI 更新
           final displayImages = (!_showSystemImages && widget.overrideImages != null)
-              ? widget.overrideImages!
+              ? controller.folderImages
               : controller.images;
 
           if (displayImages.isEmpty) {
