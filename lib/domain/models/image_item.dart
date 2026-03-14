@@ -39,4 +39,17 @@ class ImageItem {
 
   /// Calculate the aspect ratio (width / height)
   double get aspectRatio => width / height;
+
+  ImageItem copyWith({int? width, int? height}) {
+    return ImageItem(
+      id: id,
+      filePath: filePath,
+      fileName: fileName,
+      width: width ?? this.width,
+      height: height ?? this.height,
+      fileSize: fileSize,
+      modifiedTime: modifiedTime,
+      format: format,
+    );
+  }
 }

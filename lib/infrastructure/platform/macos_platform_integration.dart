@@ -50,10 +50,12 @@ class MacOSPlatformIntegration implements PlatformIntegration {
   @override
   Future<List<String>> getLaunchArguments() async {
     try {
-      // On macOS, files opened via Finder are passed through NSApplication
       final result = await _channel.invokeMethod('getOpenedFiles');
+      debugPrint('[MacOS] getOpenedFiles result: $result');
       if (result != null && result is List) {
-        return result.cast<String>();
+        final files = result.cast<String>();
+        debugPrint('[MacOS] Opened files: $files');
+        return files;
       }
       return [];
     } on PlatformException catch (e) {
@@ -62,6 +64,20 @@ class MacOSPlatformIntegration implements PlatformIntegration {
       }
       return [];
     }
+  }
+
+  /// 监听 app 已运行时通过 open with 打开的文件
+  /// 当 macOS 对已运行的 app 调用 openFile，AppDelegate 会通过 methodChannel 推送
+  void listenForOpenedFiles(void Function(String filePath) onFileOpened) {
+    _channel.setMethodCallHandler((call) async {
+      if (call.method == 'fileOpened') {
+        final filePath = call.arguments as String?;
+        if (filePath != null && filePath.isNotEmpty) {
+          debugPrint('[MacOS] Received fileOpened: $filePath');
+          onFileOpened(filePath);
+        }
+      }
+    });
   }
 
   @override

@@ -6,13 +6,75 @@ import ImageIO
 class AppDelegate: FlutterAppDelegate {
   private var openedFiles: [String] = []
   private var methodChannel: FlutterMethodChannel?
+  private var pendingFileResult: FlutterResult?
+  
+  override func applicationWillFinishLaunching(_ notification: Notification) {
+    // 注册 Apple Event handler，必须在 applicationDidFinishLaunching 之前注册
+    // 这样才能捕获冷启动时的 open document 事件
+    NSAppleEventManager.shared().setEventHandler(
+      self,
+      andSelector: #selector(handleOpenDocuments(_:withReplyEvent:)),
+      forEventClass: AEEventClass(kCoreEventClass),
+      andEventID: AEEventID(kAEOpenDocuments)
+    )
+  }
+  
+  @objc func handleOpenDocuments(_ event: NSAppleEventDescriptor, withReplyEvent replyEvent: NSAppleEventDescriptor) {
+    guard let fileList = event.paramDescriptor(forKeyword: AEKeyword(keyDirectObject)) else {
+      NSLog("[AppDelegate] handleOpenDocuments: no file list")
+      return
+    }
+    
+    var paths: [String] = []
+    let count = fileList.numberOfItems
+    NSLog("[AppDelegate] handleOpenDocuments: \(count) item(s), type: \(fileList.descriptorType)")
+    
+    func extractPath(from desc: NSAppleEventDescriptor) -> String? {
+      // 尝试 typeFileURL
+      if let urlDesc = desc.coerce(toDescriptorType: DescType(typeFileURL)) {
+        let urlData = urlDesc.data
+        if let urlString = String(data: urlData, encoding: .utf8) {
+          let cleaned = urlString.trimmingCharacters(in: .controlCharacters)
+          if let url = URL(string: cleaned) { return url.path }
+        }
+      }
+      // 尝试直接 stringValue（有时是 file:// URL 或路径）
+      if let s = desc.stringValue {
+        if s.hasPrefix("file://"), let url = URL(string: s) { return url.path }
+        if s.hasPrefix("/") { return s }
+      }
+      return nil
+    }
+    
+    if count == 0 {
+      // 单个文件（numberOfItems 为 0 表示不是列表）
+      if let path = extractPath(from: fileList) {
+        paths.append(path)
+      }
+    } else {
+      for i in 1...count {
+        if let item = fileList.atIndex(i), let path = extractPath(from: item) {
+          paths.append(path)
+        }
+      }
+    }
+    
+    NSLog("[AppDelegate] handleOpenDocuments paths: \(paths)")
+    
+    if let channel = methodChannel {
+      for path in paths {
+        NSLog("[AppDelegate] pushing fileOpened: \(path)")
+        channel.invokeMethod("fileOpened", arguments: path)
+      }
+    } else {
+      openedFiles.append(contentsOf: paths)
+    }
+  }
   
   override func applicationDidFinishLaunching(_ notification: Notification) {
-    // Get the Flutter view controller
     if let window = NSApplication.shared.windows.first,
        let flutterViewController = window.contentViewController as? FlutterViewController {
       
-      // Set up method channel
       methodChannel = FlutterMethodChannel(
         name: "image_gallery/platform",
         binaryMessenger: flutterViewController.engine.binaryMessenger
@@ -20,6 +82,18 @@ class AppDelegate: FlutterAppDelegate {
       
       methodChannel?.setMethodCallHandler { [weak self] (call, result) in
         self?.handleMethodCall(call: call, result: result)
+      }
+      
+      // 冷启动时 openedFiles 可能已有数据（来自 handleOpenDocuments 或 openFile 回调）
+      if !openedFiles.isEmpty {
+        let filesToSend = openedFiles
+        openedFiles.removeAll()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+          NSLog("[AppDelegate] Cold launch: pushing \(filesToSend.count) file(s) to Flutter")
+          for file in filesToSend {
+            self?.methodChannel?.invokeMethod("fileOpened", arguments: file)
+          }
+        }
       }
     }
   }
@@ -33,33 +107,45 @@ class AppDelegate: FlutterAppDelegate {
   }
   
   // Handle files opened via Finder
+  // - Cold launch: called BEFORE applicationDidFinishLaunching, stored in openedFiles
+  // - Hot launch (app already running): methodChannel is ready, push directly to Flutter
   override func application(_ sender: NSApplication, openFile filename: String) -> Bool {
-    openedFiles.append(filename)
+    NSLog("[AppDelegate] openFile: \(filename)")
+    if let channel = methodChannel {
+      NSLog("[AppDelegate] app already running, pushing fileOpened to Flutter")
+      channel.invokeMethod("fileOpened", arguments: filename)
+    } else {
+      openedFiles.append(filename)
+    }
     return true
   }
   
   override func application(_ sender: NSApplication, openFiles filenames: [String]) {
-    openedFiles.append(contentsOf: filenames)
+    NSLog("[AppDelegate] openFiles: \(filenames)")
+    if let channel = methodChannel {
+      for filename in filenames {
+        channel.invokeMethod("fileOpened", arguments: filename)
+      }
+    } else {
+      openedFiles.append(contentsOf: filenames)
+    }
   }
   
-  // Handle method calls from Dart
   private func handleMethodCall(call: FlutterMethodCall, result: @escaping FlutterResult) {
     switch call.method {
     case "verifyFileAssociations":
-      // File associations are configured in Info.plist
-      // This is just a verification method
       result(nil)
       
     case "openDefaultAppSettings":
-      // Open System Preferences to Default Apps
       if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?General") {
         NSWorkspace.shared.open(url)
       }
       result(nil)
       
     case "getOpenedFiles":
+      NSLog("[AppDelegate] getOpenedFiles called, files: \(openedFiles)")
       result(openedFiles)
-      openedFiles.removeAll() // Clear after returning
+      openedFiles.removeAll()
       
     case "extractExifData":
       guard let args = call.arguments as? [String: Any],
@@ -69,7 +155,6 @@ class AppDelegate: FlutterAppDelegate {
                           details: nil))
         return
       }
-      
       let exifData = extractExifData(from: filePath)
       result(exifData)
       

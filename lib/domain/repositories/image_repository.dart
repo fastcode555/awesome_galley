@@ -17,7 +17,10 @@ abstract class ImageRepository {
   /// 数据库中图片总数（用于判断是否需要重新扫描）
   Future<int> getDbImageCount();
 
-  /// 扫描指定文件夹中的所有图片
+  /// 扫描指定文件夹（不写入系统数据库，仅用于 open with 场景）
+  Future<List<ImageItem>> scanFolderOnly(String folderPath);
+
+  /// 扫描指定文件夹中的所有图片（写入数据库）
   Future<List<ImageItem>> scanFolder(String folderPath);
 
   /// 获取最近浏览的文件夹列表
@@ -25,4 +28,10 @@ abstract class ImageRepository {
 
   /// 保存最近浏览的文件夹
   Future<void> saveRecentFolder(String folderPath, {int? imageCount});
+
+  /// 删除图片：删除文件 + 数据库记录
+  Future<void> deleteImage(String filePath);
+
+  /// 更新图片的真实宽高（UI 显示后回写）
+  Future<void> updateImageSize(String filePath, int width, int height);
 }

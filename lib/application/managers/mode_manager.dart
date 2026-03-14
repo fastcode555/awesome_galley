@@ -38,19 +38,21 @@ class ModeManager extends ChangeNotifier {
   /// 
   /// [launchArgs] - The command line arguments passed to the application
   void initializeMode(List<String> launchArgs) {
-    // Filter out empty strings and Flutter-specific arguments
     final validArgs = launchArgs
         .where((arg) => arg.isNotEmpty && !arg.startsWith('--'))
         .toList();
 
+    debugPrint('[ModeManager] launchArgs: $launchArgs');
+    debugPrint('[ModeManager] validArgs: $validArgs');
+
     if (validArgs.isNotEmpty) {
-      // File association mode - launched with a file path
       _currentMode = BrowseMode.fileAssociation;
       _associatedFilePath = validArgs.first;
+      debugPrint('[ModeManager] → fileAssociation mode, file: $_associatedFilePath');
     } else {
-      // System browse mode - launched directly
       _currentMode = BrowseMode.systemBrowse;
       _associatedFilePath = null;
+      debugPrint('[ModeManager] → systemBrowse mode');
     }
 
     notifyListeners();
@@ -68,9 +70,15 @@ class ModeManager extends ChangeNotifier {
     }
   }
 
+  /// 运行时切换到 fileAssociation 模式（app 已运行时通过 open with 打开文件）
+  void switchToFileAssociation(String filePath) {
+    _currentMode = BrowseMode.fileAssociation;
+    _associatedFilePath = filePath;
+    debugPrint('[ModeManager] runtime switch → fileAssociation, file: $filePath');
+    notifyListeners();
+  }
+
   /// Checks if the current mode is File Association mode
-  /// 
-  /// Returns true if in fileAssociation mode, false otherwise
   bool isFileAssociationMode() {
     return _currentMode == BrowseMode.fileAssociation;
   }

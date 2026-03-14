@@ -262,6 +262,25 @@ class StateRepository {
       filePaths,
     );
   }
+
+  /// 删除单条图片元数据
+  Future<void> deleteImageMetadata(String filePath) async {
+    if (_db == null) return;
+    await _db!.delete(
+      'image_metadata',
+      where: 'file_path = ?',
+      whereArgs: [filePath],
+    );
+  }
+
+  /// 更新图片的真实宽高（UI 显示后回写，仅当当前值为占位值时）
+  Future<void> updateImageSize(String filePath, int width, int height) async {
+    if (_db == null) return;
+    await _db!.rawUpdate(
+      'UPDATE image_metadata SET width = ?, height = ? WHERE file_path = ? AND (width <= 1 OR height <= 1)',
+      [width, height, filePath],
+    );
+  }
 }
 
 /// Model for a recent folder entry

@@ -298,6 +298,39 @@ class ImageRepositoryImpl implements ImageRepository {
     return _resolveAndSaveMetadata(files);
   }
 
+  /// 扫描文件夹但不写入数据库（open with 场景）
+  @override
+  Future<List<ImageItem>> scanFolderOnly(String folderPath) async {
+    final fileInfoList = await _fileSystem.listImagesInFolder(folderPath);
+    final supported = fileInfoList.where((f) => f.isSupported).toList();
+    supported.sort((a, b) => a.name.compareTo(b.name));
+
+    final limited = supported.length > _folderImageLimit
+        ? supported.sublist(0, _folderImageLimit)
+        : supported;
+
+    // 直接从 DB 查缓存（只读，不写），没有缓存的用 1:1 占位
+    final filePaths = limited.map((f) => f.path).toList();
+    final cached = await _stateRepository.getImageMetadataBatch(filePaths);
+
+    return limited.map((f) {
+      final ext = path.extension(f.path).toLowerCase();
+      final db = cached[f.path];
+      final w = db?.width ?? 1;
+      final h = db?.height ?? 1;
+      return ImageItem(
+        id: _uuid.v4(),
+        filePath: f.path,
+        fileName: f.name,
+        width: w,
+        height: h,
+        fileSize: f.size,
+        modifiedTime: f.modifiedTime,
+        format: ImageFormat.fromExtension(ext),
+      );
+    }).toList();
+  }
+
   // ---------------------------------------------------------------------------
   // Recent folders
   // ---------------------------------------------------------------------------
@@ -311,6 +344,22 @@ class ImageRepositoryImpl implements ImageRepository {
   @override
   Future<void> saveRecentFolder(String folderPath, {int? imageCount}) async {
     await _stateRepository.addRecentFolder(folderPath, imageCount: imageCount);
+  }
+
+  @override
+  Future<void> deleteImage(String filePath) async {
+    // 1. 删除数据库记录
+    await _stateRepository.deleteImageMetadata(filePath);
+    // 2. 删除文件
+    final file = File(filePath);
+    if (await file.exists()) {
+      await file.delete();
+    }
+  }
+
+  @override
+  Future<void> updateImageSize(String filePath, int width, int height) async {
+    await _stateRepository.updateImageSize(filePath, width, height);
   }
 
   // ---------------------------------------------------------------------------

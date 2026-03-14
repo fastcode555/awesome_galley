@@ -11,6 +11,7 @@ class GalleryController extends ChangeNotifier {
   final CacheManager _cacheManager;
 
   List<ImageItem> _images = [];
+  List<ImageItem> _folderImages = []; // open with 场景专用，不污染系统浏览
   BrowseMode _currentMode = BrowseMode.systemBrowse;
   String? _currentFolderPath;
   bool _isLoading = false;
@@ -29,6 +30,7 @@ class GalleryController extends ChangeNotifier {
         _cacheManager = cacheManager;
 
   List<ImageItem> get images => List.unmodifiable(_images);
+  List<ImageItem> get folderImages => List.unmodifiable(_folderImages);
   BrowseMode get currentMode => _currentMode;
   String? get currentFolderPath => _currentFolderPath;
   bool get isLoading => _isLoading;
@@ -175,7 +177,20 @@ class GalleryController extends ChangeNotifier {
     }
   }
 
-  /// 加载指定文件夹
+  /// 加载指定文件夹（open with 场景）
+  /// 只加载该文件夹的图片，不写入系统数据库，不影响系统浏览的 images
+  Future<void> loadFolderImagesForViewer(String folderPath) async {
+    _setLoading(true);
+    _folderImages = [];
+    try {
+      _folderImages = await _repository.scanFolderOnly(folderPath);
+      _setLoading(false);
+    } catch (e) {
+      _setError('Failed to load folder: $e');
+    }
+  }
+
+  /// 加载指定文件夹（写入数据库，用于最近文件夹功能）
   Future<void> loadFolderImages(String folderPath) async {
     if (_isLoading) return;
 
@@ -192,6 +207,33 @@ class GalleryController extends ChangeNotifier {
       _setLoading(false);
     } catch (e) {
       _setError('Failed to load folder: $e');
+    }
+  }
+
+  /// 删除图片：删除文件、数据库记录，并从当前列表移除
+  Future<void> deleteImage(String filePath) async {
+    try {
+      await _repository.deleteImage(filePath);
+      _images.removeWhere((img) => img.filePath == filePath);
+      _dbOffset = (_dbOffset - 1).clamp(0, _dbOffset);
+      notifyListeners();
+    } catch (e) {
+      print('[GalleryController] Delete failed: $e');
+    }
+  }
+
+  /// 图片在 UI 显示后更新真实宽高到 DB（针对扫描时未能解析尺寸的图片）
+  Future<void> updateImageSize(String filePath, int width, int height) async {
+    try {
+      await _repository.updateImageSize(filePath, width, height);
+      // 更新内存中的 item，触发 UI 刷新（AspectRatio 会重新计算）
+      final idx = _images.indexWhere((img) => img.filePath == filePath);
+      if (idx >= 0 && (_images[idx].width <= 1 || _images[idx].height <= 1)) {
+        _images[idx] = _images[idx].copyWith(width: width, height: height);
+        notifyListeners();
+      }
+    } catch (e) {
+      // 非关键操作，静默失败
     }
   }
 

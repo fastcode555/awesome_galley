@@ -7,6 +7,8 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'application/managers/mode_manager.dart';
 import 'application/controllers/gallery_controller.dart';
 import 'domain/models/browse_mode.dart';
+import 'domain/models/image_item.dart';
+import 'domain/models/image_format.dart';
 import 'domain/repositories/image_repository.dart';
 import 'domain/repositories/image_repository_impl.dart';
 import 'infrastructure/cache/cache_manager.dart';
@@ -14,6 +16,7 @@ import 'infrastructure/repositories/state_repository.dart';
 import 'infrastructure/services/file_system_service.dart';
 import 'infrastructure/services/file_system_service_impl.dart';
 import 'infrastructure/platform/platform_integration_factory.dart';
+import 'infrastructure/platform/macos_platform_integration.dart';
 import 'infrastructure/platform/permission_manager.dart';
 import 'presentation/views/waterfall_view.dart';
 import 'presentation/views/single_image_viewer.dart';
@@ -288,6 +291,9 @@ class AppHome extends StatefulWidget {
 }
 
 class _AppHomeState extends State<AppHome> with WidgetsBindingObserver {
+  // open with 模式下，关闭详情页后显示文件夹瀑布流
+  bool _showFolderWaterfall = false;
+
   @override
   void initState() {
     super.initState();
@@ -295,6 +301,7 @@ class _AppHomeState extends State<AppHome> with WidgetsBindingObserver {
     // Defer initialization until after first frame
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _initializeApp();
+      _setupFileOpenedListener();
     });
   }
 
@@ -314,28 +321,47 @@ class _AppHomeState extends State<AppHome> with WidgetsBindingObserver {
     }
   }
 
+  /// 监听 app 已运行时通过 open with 打开的文件（热启动场景）
+  void _setupFileOpenedListener() {
+    if (!Platform.isMacOS) return;
+    final platformIntegration = PlatformIntegrationFactory.create();
+    if (platformIntegration is MacOSPlatformIntegration) {
+      platformIntegration.listenForOpenedFiles((filePath) async {
+        if (!mounted) return;
+        print('[AppHome] fileOpened received: $filePath');
+        final galleryController = context.read<GalleryController>();
+        final modeManager = context.read<ModeManager>();
+        // 先加载文件夹图片，再切换模式，避免 UI 闪烁
+        final folder = File(filePath).parent.path;
+        await galleryController.loadFolderImagesForViewer(folder);
+        if (mounted) {
+          modeManager.switchToFileAssociation(filePath);
+        }
+      });
+    }
+  }
+
   /// Initialize app based on browse mode
   Future<void> _initializeApp() async {
     final modeManager = context.read<ModeManager>();
     final galleryController = context.read<GalleryController>();
 
-    print('[DEBUG] Initializing app with mode: ${modeManager.currentMode}');
+    print('[DEBUG] Initializing app, mode: ${modeManager.currentMode}');
 
-    if (modeManager.currentMode == BrowseMode.systemBrowse) {
-      // System browse mode - load system images
-      print('[DEBUG] Loading system images...');
-      await galleryController.loadSystemImages();
-      print('[DEBUG] System images loaded: ${galleryController.images.length} images');
-    } else if (modeManager.currentMode == BrowseMode.fileAssociation) {
-      // File association mode - load folder and show single image viewer
+    if (modeManager.currentMode == BrowseMode.fileAssociation) {
+      // 冷启动时 getLaunchArguments 成功拿到文件（兼容路径）
       final filePath = modeManager.associatedFilePath;
       if (filePath != null) {
-        print('[DEBUG] Loading folder images from: $filePath');
-        // Extract folder path from file path
+        print('[DEBUG] Cold launch fileAssociation: $filePath');
         final folder = File(filePath).parent.path;
-        await galleryController.loadFolderImages(folder);
-        print('[DEBUG] Folder images loaded: ${galleryController.images.length} images');
+        await galleryController.loadFolderImagesForViewer(folder);
       }
+    } else {
+      // systemBrowse 模式（包括冷启动 getLaunchArguments 返回空的情况）
+      // 热启动的 open with 会通过 fileOpened push 来切换
+      print('[DEBUG] Loading system images...');
+      await galleryController.loadSystemImages();
+      print('[DEBUG] System images loaded: ${galleryController.images.length}');
     }
   }
 
@@ -343,45 +369,82 @@ class _AppHomeState extends State<AppHome> with WidgetsBindingObserver {
   Widget build(BuildContext context) {
     return Consumer<ModeManager>(
       builder: (context, modeManager, child) {
+        // open with 模式
         if (modeManager.currentMode == BrowseMode.fileAssociation &&
             modeManager.associatedFilePath != null) {
-          // File association mode - show single image viewer directly
+          // 关闭详情页后，显示该文件夹的瀑布流
+          if (_showFolderWaterfall) {
+            return _buildFolderWaterfallView();
+          }
           return _buildFileAssociationView(modeManager.associatedFilePath!);
-        } else {
-          // System browse mode - show waterfall view
-          return const WaterfallView();
         }
+        return const WaterfallView();
       },
     );
   }
 
-  /// Build view for file association mode
+  /// 文件夹瀑布流视图（open with 关闭详情页后显示）
+  Widget _buildFolderWaterfallView() {
+    return Consumer<GalleryController>(
+      builder: (context, galleryController, child) {
+        return WaterfallView(
+          overrideImages: galleryController.folderImages,
+          onImageTap: (images, index) {
+            setState(() => _showFolderWaterfall = false);
+            // 重新进入详情页需要更新 associatedFilePath
+            final modeManager = context.read<ModeManager>();
+            modeManager.switchToFileAssociation(images[index].filePath);
+          },
+        );
+      },
+    );
+  }
+
+  /// open with 模式：只显示该文件夹的图片，不加载系统图片
   Widget _buildFileAssociationView(String filePath) {
     return Consumer<GalleryController>(
       builder: (context, galleryController, child) {
-        final images = galleryController.images;
-        
-        if (images.isEmpty) {
-          // Still loading
+        // 还在加载中
+        if (galleryController.isLoading) {
           return const Scaffold(
-            body: Center(
-              child: CircularProgressIndicator(),
-            ),
+            body: Center(child: CircularProgressIndicator()),
           );
         }
 
-        // Find the index of the associated file
+        final images = galleryController.folderImages;
+
+        // 加载完但文件夹为空，只显示这一张
+        if (images.isEmpty) {
+          return SingleImageViewer(
+            images: [
+              ImageItem(
+                id: '0',
+                filePath: filePath,
+                fileName: File(filePath).uri.pathSegments.last,
+                width: 0,
+                height: 0,
+                fileSize: 0,
+                modifiedTime: DateTime.now(),
+                format: ImageFormat.fromExtension(
+                  filePath.contains('.')
+                      ? '.${filePath.split('.').last.toLowerCase()}'
+                      : '',
+                ),
+              )
+            ],
+            initialIndex: 0,
+            onClose: () => setState(() => _showFolderWaterfall = true),
+          );
+        }
+
+        // 定位到被打开的那张图片
         final index = images.indexWhere((img) => img.filePath == filePath);
         final initialIndex = index >= 0 ? index : 0;
 
         return SingleImageViewer(
           images: images,
           initialIndex: initialIndex,
-          onClose: () {
-            // When closing single image viewer in file association mode,
-            // show the waterfall view of the folder
-            Navigator.of(context).pop();
-          },
+          onClose: () => setState(() => _showFolderWaterfall = true),
         );
       },
     );
