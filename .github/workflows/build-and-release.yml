@@ -1,0 +1,159 @@
+name: Build and Release
+
+on:
+  push:
+    branches: [master, main]
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [master, main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+  pull-requests: read
+
+env:
+  FLUTTER_VERSION: '3.35.1'
+
+jobs:
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Enable macOS Desktop
+        run: flutter config --enable-macos-desktop
+
+      - name: Get Dependencies
+        run: flutter pub get
+
+      - name: Analyze Code
+        run: flutter analyze
+        continue-on-error: true
+
+      - name: Build macOS
+        run: flutter build macos --release
+
+      - name: Create DMG
+        run: |
+          DATE=$(date +%Y-%m-%d)
+          COMMIT="${{ github.sha }}"
+          COMMIT_SHORT="${COMMIT:0:7}"
+          VERSION="1.0.0"
+
+          mkdir -p release
+
+          APP_NAME="awesome_galley.app"
+          DMG_NAME="AwesomeGallery-macOS-v${VERSION}-${DATE}-${COMMIT_SHORT}.dmg"
+          VOLUME_NAME="Awesome Gallery"
+          DMG_TEMP="dmg_temp"
+
+          echo "Creating DMG..."
+          mkdir -p "${DMG_TEMP}"
+          cp -R "build/macos/Build/Products/Release/${APP_NAME}" "${DMG_TEMP}/"
+          ln -s /Applications "${DMG_TEMP}/Applications"
+
+          cat > "${DMG_TEMP}/README.txt" << 'EOF'
+          Awesome Gallery - Installation
+          ================================
+          1. Drag "awesome_galley.app" to the "Applications" folder
+          2. Launch from Applications or Spotlight
+          EOF
+
+          chmod -R 755 "${DMG_TEMP}/${APP_NAME}"
+
+          hdiutil create -srcfolder "${DMG_TEMP}" \
+                         -volname "${VOLUME_NAME}" \
+                         -fs HFS+ \
+                         -format UDZO \
+                         -imagekey zlib-level=9 \
+                         "release/${DMG_NAME}"
+
+          rm -rf "${DMG_TEMP}"
+
+          echo "Verifying DMG..."
+          hdiutil verify "release/${DMG_NAME}"
+
+          echo "Testing DMG mount..."
+          MOUNT_POINT=$(hdiutil attach "release/${DMG_NAME}" | grep "/Volumes" | tail -1 | sed 's/.*\(\/Volumes\/.*\)/\1/')
+          if [ -n "$MOUNT_POINT" ]; then
+            echo "DMG mounted at: $MOUNT_POINT"
+            hdiutil detach "$MOUNT_POINT"
+          else
+            echo "Failed to mount DMG"
+            exit 1
+          fi
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-build
+          path: release/*.dmg
+
+  create-release:
+    needs: [build-macos]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Get Version Info
+        id: version
+        run: |
+          echo "date=$(date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
+          COMMIT="${{ github.sha }}"
+          echo "commit=${COMMIT:0:7}" >> $GITHUB_OUTPUT
+
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            VERSION="${{ github.ref_name }}"
+            echo "version=${VERSION#v}" >> $GITHUB_OUTPUT
+            echo "tag=${VERSION}" >> $GITHUB_OUTPUT
+          else
+            DATE=$(date +'%Y-%m-%d')
+            COMMIT_SHORT="${COMMIT:0:7}"
+            echo "version=1.0.0" >> $GITHUB_OUTPUT
+            echo "tag=v1.0.0-${DATE}-${COMMIT_SHORT}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Download Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: Awesome Gallery v${{ steps.version.outputs.version }} - ${{ steps.version.outputs.date }}
+          body: |
+            ## Awesome Gallery
+
+            **Build Date:** ${{ steps.version.outputs.date }}
+            **Version:** ${{ steps.version.outputs.version }}
+            **Commit:** ${{ steps.version.outputs.commit }}
+
+            ### Features
+            - Browse all system images in a masonry waterfall layout
+            - Open images via Finder "Open With"
+            - Image detail view with file info and reveal in Finder
+            - Hover to preview filename, size, and delete
+            - SQLite metadata cache for fast startup
+
+            ### Installation (macOS)
+            1. Download `AwesomeGallery-macOS-*.dmg`
+            2. Open the DMG and drag the app to Applications
+            3. Launch from Applications or Spotlight
+
+          files: artifacts/macos-build/*.dmg
+          draft: false
+          prerelease: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
