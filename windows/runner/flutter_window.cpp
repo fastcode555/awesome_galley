@@ -69,3 +69,10 @@ FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
 
   return Win32Window::MessageHandler(hwnd, message, wparam, lparam);
 }
+
+flutter::PluginRegistrarWindows* FlutterWindow::GetRegistrar() {
+  if (flutter_controller_ && flutter_controller_->engine()) {
+    return flutter_controller_->engine()->GetRegistrarForPlugin("image_gallery");
+  }
+  return nullptr;
+}

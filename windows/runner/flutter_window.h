@@ -22,6 +22,9 @@ class FlutterWindow : public Win32Window {
   LRESULT MessageHandler(HWND window, UINT const message, WPARAM const wparam,
                          LPARAM const lparam) noexcept override;
 
+  // Get the plugin registrar for registering platform channels
+  flutter::PluginRegistrarWindows* GetRegistrar();
+
  private:
   // The project to run.
   flutter::DartProject project_;
