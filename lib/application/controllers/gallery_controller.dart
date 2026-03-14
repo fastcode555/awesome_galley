@@ -215,6 +215,7 @@ class GalleryController extends ChangeNotifier {
     try {
       await _repository.deleteImage(filePath);
       _images.removeWhere((img) => img.filePath == filePath);
+      _folderImages.removeWhere((img) => img.filePath == filePath);
       _dbOffset = (_dbOffset - 1).clamp(0, _dbOffset);
       notifyListeners();
     } catch (e) {
