@@ -6,7 +6,6 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import 'application/managers/mode_manager.dart';
 import 'application/controllers/gallery_controller.dart';
-import 'application/controllers/image_controller.dart';
 import 'domain/models/browse_mode.dart';
 import 'domain/repositories/image_repository.dart';
 import 'domain/repositories/image_repository_impl.dart';
@@ -23,31 +22,9 @@ import 'presentation/theme/theme_manager.dart';
 import 'core/errors/errors.dart';
 import 'core/logging/logging.dart';
 
-/// Application entry point
-/// 
-/// Configures error handling, initializes services, and starts the app
-/// Requirements: 10.1, 10.2, 10.3, 10.4, 10.5, 10.6, 12.1, 13.1
-void main() async {
-  // Ensure Flutter binding is initialized
-  WidgetsFlutterBinding.ensureInitialized();
-
-  // Initialize logger
-  final logger = Logger();
-  await logger.initialize(
-    enableConsole: true,
-    enableFile: true,
-  );
-
-  // Initialize error handler
-  final errorHandler = ErrorHandler();
-  errorHandler.initialize();
-
-  logger.info('Application starting...');
-
-  // Run app with error handling
-  await runAppWithErrorHandling(
-    const ImageGalleryAppWrapper(),
-  );
+void main() {
+  // Run app with error handling (ensureInitialized is called inside the zone)
+  runAppWithErrorHandling(const ImageGalleryAppWrapper());
 }
 
 /// Wrapper widget to initialize app
@@ -161,6 +138,13 @@ class AppInitializer {
   /// Initialize all application services
   Future<void> initialize() async {
     _logger = Logger();
+
+    // Initialize logger first
+    await _logger.initialize(
+      enableConsole: true,
+      enableFile: true,
+    );
+    _logger.info('Application starting...');
 
     // Initialize SharedPreferences
     _prefs = await SharedPreferences.getInstance();
@@ -276,12 +260,6 @@ class ImageGalleryApp extends StatelessWidget {
         ChangeNotifierProvider<GalleryController>(
           create: (_) => GalleryController(
             repository: initializer.imageRepository,
-            cacheManager: initializer.cacheManager,
-          ),
-        ),
-        // Provide ImageController
-        Provider<ImageController>(
-          create: (_) => ImageController(
             cacheManager: initializer.cacheManager,
           ),
         ),

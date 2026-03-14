@@ -1,27 +1,142 @@
 import 'dart:async';
-import 'package:awesome_galley/domain/models/image_item.dart';
-import 'package:awesome_galley/infrastructure/services/file_system_service.dart';
-import 'package:awesome_galley/infrastructure/repositories/state_repository.dart';
-import 'package:image/image.dart' as img;
 import 'dart:io';
+import 'dart:isolate';
+import 'package:awesome_galley/domain/models/image_format.dart';
+import 'package:awesome_galley/domain/models/image_item.dart';
+import 'package:awesome_galley/infrastructure/repositories/state_repository.dart';
+import 'package:awesome_galley/infrastructure/services/file_system_service.dart';
+import 'package:image/image.dart' as img;
+import 'package:path/path.dart' as path;
 import 'package:uuid/uuid.dart';
 import 'image_repository.dart';
 
-/// ImageRepository 的实现类
-/// 
-/// 负责扫描和加载图片数据，支持两种模式：
-/// - 系统图片浏览模式：扫描系统预定义目录（最多 10000 张）
-/// - 文件夹浏览模式：扫描指定文件夹（最多 1000 张）
+// ---------------------------------------------------------------------------
+// 常量
+// ---------------------------------------------------------------------------
+
+const int _systemImageLimit = 50000;
+const int _folderImageLimit = 5000;
+
+const Set<String> _skipDirNames = {
+  'Library', 'System', 'Applications', '.Trash',
+  'node_modules', '.git', '.cache', 'Cache', 'Caches',
+  '.npm', '.gradle', '.m2', 'AppData', 'ProgramData',
+  'Windows', 'Program Files', 'Program Files (x86)',
+  'build',
+};
+
+const Set<String> _supportedExtensions = {
+  '.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp',
+};
+
+// ---------------------------------------------------------------------------
+// Isolate 消息类型
+// ---------------------------------------------------------------------------
+
+class _ScanParams {
+  final SendPort sendPort;
+  final String rootDir;
+  _ScanParams(this.sendPort, this.rootDir);
+}
+
+class _FileBatch {
+  final List<Map<String, dynamic>> files;
+  _FileBatch(this.files);
+}
+
+class _ScanDone {
+  const _ScanDone();
+}
+
+// ---------------------------------------------------------------------------
+// Isolate 入口（顶层函数）
+// ---------------------------------------------------------------------------
+
+Future<void> _scanIsolateEntry(_ScanParams params) async {
+  await _scanDirRecursive(Directory(params.rootDir), params.sendPort, 0);
+  params.sendPort.send(const _ScanDone());
+}
+
+bool _shouldSkipDir(String dirName) {
+  if (dirName.startsWith('.')) return true;
+  return _skipDirNames.contains(dirName);
+}
+
+Future<void> _scanDirRecursive(
+  Directory dir,
+  SendPort sendPort,
+  int depth,
+) async {
+  if (depth > 10) return;
+  if (_shouldSkipDir(path.basename(dir.path))) return;
+
+  final batch = <Map<String, dynamic>>[];
+
+  try {
+    await for (final entity in dir.list(followLinks: false)) {
+      try {
+        if (entity is File) {
+          final ext = path.extension(entity.path).toLowerCase();
+          if (_supportedExtensions.contains(ext)) {
+            final stat = await entity.stat();
+            batch.add({
+              'filePath': entity.path,
+              'fileName': path.basename(entity.path),
+              'fileSize': stat.size,
+              'modifiedTime': stat.modified.millisecondsSinceEpoch,
+              'ext': ext,
+            });
+          }
+        } else if (entity is Directory) {
+          if (batch.isNotEmpty) {
+            sendPort.send(_FileBatch(List.of(batch)));
+            batch.clear();
+          }
+          await _scanDirRecursive(entity, sendPort, depth + 1);
+        }
+      } catch (_) {}
+    }
+  } catch (_) {}
+
+  if (batch.isNotEmpty) {
+    sendPort.send(_FileBatch(List.of(batch)));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 在独立 isolate 中解析图片宽高（只读头部，不完整解码）
+// ---------------------------------------------------------------------------
+
+Future<List<Map<String, dynamic>>> _decodeDimensionsBatch(
+  List<Map<String, dynamic>> files,
+) async {
+  final result = <Map<String, dynamic>>[];
+  for (final f in files) {
+    try {
+      final bytes = await File(f['filePath'] as String).readAsBytes();
+      // findDecoderForData + startDecode 只解析头部，速度远快于完整解码
+      final decoder = img.findDecoderForData(bytes);
+      final info = decoder?.startDecode(bytes);
+      result.add({
+        ...f,
+        'width': info?.width ?? 1,
+        'height': info?.height ?? 1,
+      });
+    } catch (_) {
+      result.add({...f, 'width': 1, 'height': 1});
+    }
+  }
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// Repository 实现
+// ---------------------------------------------------------------------------
+
 class ImageRepositoryImpl implements ImageRepository {
   final FileSystemService _fileSystem;
   final StateRepository _stateRepository;
-  final Uuid _uuid = const Uuid();
-
-  /// 系统浏览模式的图片数量限制
-  static const int systemImageLimit = 10000;
-
-  /// 文件夹浏览模式的图片数量限制
-  static const int folderImageLimit = 1000;
+  final _uuid = const Uuid();
 
   ImageRepositoryImpl({
     required FileSystemService fileSystemService,
@@ -29,68 +144,168 @@ class ImageRepositoryImpl implements ImageRepository {
   })  : _fileSystem = fileSystemService,
         _stateRepository = stateRepository;
 
+  // ---------------------------------------------------------------------------
+  // 扫描系统目录 → 写入数据库 → 流式返回给 UI
+  // ---------------------------------------------------------------------------
+
   @override
-  Future<List<ImageItem>> scanSystemDirectories() async {
-    print('[ImageRepository] Scanning system directories...');
-    // 获取系统图片目录
-    final directories = await _fileSystem.getSystemImageDirectories();
-    print('[ImageRepository] Found ${directories.length} directories: $directories');
+  Stream<List<ImageItem>> scanSystemDirectoriesStream() async* {
+    final dirs = await _fileSystem.getSystemImageDirectories();
+    if (dirs.isEmpty) return;
 
-    if (directories.isEmpty) {
-      print('[ImageRepository] No directories found');
-      return [];
+    int totalCount = 0;
+
+    for (final rootDir in dirs) {
+      final receivePort = ReceivePort();
+      final isolate = await Isolate.spawn(
+        _scanIsolateEntry,
+        _ScanParams(receivePort.sendPort, rootDir),
+        errorsAreFatal: false,
+      );
+
+      await for (final msg in receivePort) {
+        if (msg is _FileBatch) {
+          final items = await _resolveAndSaveMetadata(msg.files);
+          if (items.isNotEmpty) {
+            totalCount += items.length;
+            yield items;
+          }
+          if (totalCount >= _systemImageLimit) {
+            isolate.kill(priority: Isolate.immediate);
+            receivePort.close();
+            return;
+          }
+        } else if (msg is _ScanDone) {
+          receivePort.close();
+          break;
+        }
+      }
+
+      isolate.kill(priority: Isolate.immediate);
     }
-
-    // 并行扫描所有目录
-    final futures = directories.map((dir) => _scanDirectory(dir));
-    final results = await Future.wait(futures);
-
-    // 合并所有结果
-    final allImages = <ImageItem>[];
-    for (final images in results) {
-      allImages.addAll(images);
-    }
-    print('[ImageRepository] Total images found: ${allImages.length}');
-
-    // 按修改日期降序排序（最新的在前）
-    allImages.sort((a, b) => b.modifiedTime.compareTo(a.modifiedTime));
-
-    // 限制最多 10000 张图片
-    if (allImages.length > systemImageLimit) {
-      return allImages.sublist(0, systemImageLimit);
-    }
-
-    return allImages;
   }
+
+  // ---------------------------------------------------------------------------
+  // 从数据库分页加载（校验文件存在性）
+  // ---------------------------------------------------------------------------
+
+  @override
+  Future<List<ImageItem>> loadPageFromDb({
+    required int limit,
+    required int offset,
+  }) async {
+    // 多取一些，因为部分文件可能已不存在
+    final rows = await _stateRepository.getImageMetadataPage(
+      limit: limit + 20,
+      offset: offset,
+    );
+
+    final valid = <ImageItem>[];
+    final toDelete = <String>[];
+
+    for (final row in rows) {
+      final exists = await File(row.filePath).exists();
+      if (!exists) {
+        toDelete.add(row.filePath);
+        continue;
+      }
+      valid.add(_buildItemFromCache(row));
+      if (valid.length >= limit) break;
+    }
+
+    // 异步删除失效记录，不阻塞返回
+    if (toDelete.isNotEmpty) {
+      _stateRepository.deleteImageMetadataBatch(toDelete);
+    }
+
+    return valid;
+  }
+
+  @override
+  Future<int> getDbImageCount() => _stateRepository.getImageMetadataCount();
+
+  // ---------------------------------------------------------------------------
+  // 解析元数据：先查 DB，没有的才解码；结果写入 DB
+  // ---------------------------------------------------------------------------
+
+  Future<List<ImageItem>> _resolveAndSaveMetadata(
+    List<Map<String, dynamic>> files,
+  ) async {
+    if (files.isEmpty) return [];
+
+    final filePaths = files.map((f) => f['filePath'] as String).toList();
+    final cached = await _stateRepository.getImageMetadataBatch(filePaths);
+
+    final needDecode = <Map<String, dynamic>>[];
+    final result = <ImageItem>[];
+
+    for (final f in files) {
+      final fp = f['filePath'] as String;
+      final modTime = f['modifiedTime'] as int;
+      final dbEntry = cached[fp];
+
+      if (dbEntry != null && dbEntry.modifiedTime == modTime) {
+        result.add(_buildItemFromCache(dbEntry));
+      } else {
+        needDecode.add(f);
+      }
+    }
+
+    if (needDecode.isNotEmpty) {
+      // 使用 decodeImageHeader 只读取头部，速度远快于完整解码
+      final decoded = await Isolate.run(() => _decodeDimensionsBatch(needDecode));
+
+      final toSave = decoded.map((d) => ImageMetadataCache(
+            filePath: d['filePath'] as String,
+            width: d['width'] as int,
+            height: d['height'] as int,
+            fileSize: d['fileSize'] as int,
+            modifiedTime: d['modifiedTime'] as int,
+            format: d['ext'] as String,
+          )).toList();
+      await _stateRepository.saveImageMetadataBatch(toSave);
+
+      for (final d in decoded) {
+        result.add(_buildItem(d, d['width'] as int, d['height'] as int));
+      }
+    }
+
+    return result;
+  }
+
+  // ---------------------------------------------------------------------------
+  // 扫描指定文件夹
+  // ---------------------------------------------------------------------------
 
   @override
   Future<List<ImageItem>> scanFolder(String folderPath) async {
-    // 扫描指定文件夹
     final fileInfoList = await _fileSystem.listImagesInFolder(folderPath);
+    final supported = fileInfoList.where((f) => f.isSupported).toList();
+    supported.sort((a, b) => a.name.compareTo(b.name));
 
-    // 过滤支持的格式
-    final supportedFiles = fileInfoList.where((file) => file.isSupported).toList();
+    final limited = supported.length > _folderImageLimit
+        ? supported.sublist(0, _folderImageLimit)
+        : supported;
 
-    // 按文件名字母顺序排序
-    supportedFiles.sort((a, b) => a.name.compareTo(b.name));
+    final files = limited.map((f) => {
+          'filePath': f.path,
+          'fileName': f.name,
+          'fileSize': f.size,
+          'modifiedTime': f.modifiedTime.millisecondsSinceEpoch,
+          'ext': path.extension(f.path).toLowerCase(),
+        }).toList();
 
-    // 限制最多 1000 张图片
-    final limitedFiles = supportedFiles.length > folderImageLimit
-        ? supportedFiles.sublist(0, folderImageLimit)
-        : supportedFiles;
-
-    // 转换为 ImageItem 列表
-    final images = await Future.wait(
-      limitedFiles.map((file) => _fileInfoToImageItem(file)),
-    );
-
-    return images;
+    return _resolveAndSaveMetadata(files);
   }
+
+  // ---------------------------------------------------------------------------
+  // Recent folders
+  // ---------------------------------------------------------------------------
 
   @override
   Future<List<String>> getRecentFolders() async {
-    final recentFolders = await _stateRepository.getRecentFolders();
-    return recentFolders.map((folder) => folder.folderPath).toList();
+    final folders = await _stateRepository.getRecentFolders();
+    return folders.map((f) => f.folderPath).toList();
   }
 
   @override
@@ -98,94 +313,33 @@ class ImageRepositoryImpl implements ImageRepository {
     await _stateRepository.addRecentFolder(folderPath, imageCount: imageCount);
   }
 
-  /// 扫描单个目录中的所有图片
-  /// 
-  /// 递归扫描目录及其所有子目录
-  Future<List<ImageItem>> _scanDirectory(String directoryPath) async {
-    try {
-      print('[ImageRepository] Scanning directory recursively: $directoryPath');
-      // 递归扫描，最大深度 10 层
-      final fileInfoList = await _fileSystem.listImagesInFolder(
-        directoryPath,
-        recursive: true,
-        maxDepth: 10,
-      );
+  // ---------------------------------------------------------------------------
+  // 构建 ImageItem
+  // ---------------------------------------------------------------------------
 
-      print('[ImageRepository] Found ${fileInfoList.length} images in $directoryPath');
-
-      // 过滤支持的格式
-      final supportedFiles = fileInfoList.where((file) => file.isSupported).toList();
-
-      // 转换为 ImageItem 列表
-      final images = await Future.wait(
-        supportedFiles.map((file) => _fileInfoToImageItem(file)),
-      );
-
-      return images;
-    } catch (e) {
-      // 如果扫描失败（权限不足等），返回空列表
-      print('[ImageRepository] Failed to scan directory $directoryPath: $e');
-      return [];
-    }
-  }
-
-  /// 将 FileInfo 转换为 ImageItem
-  /// 
-  /// 需要读取图片文件以获取宽度和高度信息
-  /// 注意：这个方法会读取图片文件，可能会影响性能
-  Future<ImageItem> _fileInfoToImageItem(dynamic fileInfo) async {
-    // 读取图片尺寸
-    final dimensions = await _getImageDimensions(fileInfo.path);
-
+  ImageItem _buildItemFromCache(ImageMetadataCache c) {
     return ImageItem(
       id: _uuid.v4(),
-      filePath: fileInfo.path,
-      fileName: fileInfo.name,
-      width: dimensions.width,
-      height: dimensions.height,
-      fileSize: fileInfo.size,
-      modifiedTime: fileInfo.modifiedTime,
-      format: fileInfo.format,
+      filePath: c.filePath,
+      fileName: path.basename(c.filePath),
+      width: c.width,
+      height: c.height,
+      fileSize: c.fileSize,
+      modifiedTime: DateTime.fromMillisecondsSinceEpoch(c.modifiedTime),
+      format: ImageFormat.fromExtension(c.format),
     );
   }
 
-  /// 获取图片的宽度和高度
-  /// 
-  /// 使用 image 包解码图片以获取尺寸信息
-  /// 如果解码失败（文件不存在、损坏等），返回默认尺寸 (1, 1)
-  /// 
-  /// 注意：为了性能考虑，这里只解码图片头部信息获取尺寸
-  /// 但 image 包目前不支持只读取头部，所以会读取整个文件
-  /// 未来可以考虑使用更高效的方法（如 image_size_getter 包）
-  Future<ImageDimensions> _getImageDimensions(String filePath) async {
-    try {
-      final file = File(filePath);
-      
-      // 检查文件是否存在
-      if (!await file.exists()) {
-        return ImageDimensions(width: 1, height: 1);
-      }
-      
-      final bytes = await file.readAsBytes();
-      final image = img.decodeImage(bytes);
-
-      if (image != null) {
-        return ImageDimensions(width: image.width, height: image.height);
-      }
-    } catch (e) {
-      // 如果解码失败（文件损坏、格式不支持等），返回默认尺寸
-      // 这样可以避免单个图片错误影响整个扫描过程
-    }
-
-    // 默认尺寸（避免除零错误）
-    return ImageDimensions(width: 1, height: 1);
+  ImageItem _buildItem(Map<String, dynamic> f, int w, int h) {
+    return ImageItem(
+      id: _uuid.v4(),
+      filePath: f['filePath'] as String,
+      fileName: f['fileName'] as String,
+      width: w,
+      height: h,
+      fileSize: f['fileSize'] as int,
+      modifiedTime: DateTime.fromMillisecondsSinceEpoch(f['modifiedTime'] as int),
+      format: ImageFormat.fromExtension(f['ext'] as String),
+    );
   }
-}
-
-/// 图片尺寸信息
-class ImageDimensions {
-  final int width;
-  final int height;
-
-  ImageDimensions({required this.width, required this.height});
 }

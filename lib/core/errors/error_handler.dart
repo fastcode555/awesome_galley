@@ -256,9 +256,11 @@ Future<void> runAppWithErrorHandling(Widget app) async {
   // Initialize error handler
   ErrorHandler().initialize();
 
-  // Run app in guarded zone
+  // Run app in guarded zone - binding must be initialized inside the zone
+  // to avoid zone mismatch warnings
   runZonedGuarded(
-    () {
+    () async {
+      WidgetsFlutterBinding.ensureInitialized();
       runApp(app);
     },
     (error, stackTrace) {

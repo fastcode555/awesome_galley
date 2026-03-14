@@ -27,8 +27,22 @@ class StateRepository {
 
     _db = await openDatabase(
       dbPath,
-      version: 1,
+      version: 2,
       onCreate: _createTables,
+      onUpgrade: (db, oldVersion, newVersion) async {
+        if (oldVersion < 2) {
+          await db.execute('''
+            CREATE TABLE IF NOT EXISTS image_metadata (
+              file_path TEXT PRIMARY KEY,
+              width INTEGER NOT NULL,
+              height INTEGER NOT NULL,
+              file_size INTEGER NOT NULL,
+              modified_time INTEGER NOT NULL,
+              format TEXT NOT NULL
+            )
+          ''');
+        }
+      },
     );
   }
 
@@ -62,6 +76,18 @@ class StateRepository {
         file_size INTEGER NOT NULL,
         created_at INTEGER NOT NULL,
         last_accessed INTEGER NOT NULL
+      )
+    ''');
+
+    // Image metadata table - 缓存图片的宽高等信息，避免重复解析
+    await db.execute('''
+      CREATE TABLE image_metadata (
+        file_path TEXT PRIMARY KEY,
+        width INTEGER NOT NULL,
+        height INTEGER NOT NULL,
+        file_size INTEGER NOT NULL,
+        modified_time INTEGER NOT NULL,
+        format TEXT NOT NULL
       )
     ''');
   }
@@ -142,6 +168,100 @@ class StateRepository {
     await _db?.close();
     _db = null;
   }
+
+  // ========== Image Metadata Methods ==========
+
+  /// 查询图片元数据缓存
+  /// 
+  /// 如果文件的 modifiedTime 与数据库记录一致，说明缓存有效
+  Future<ImageMetadataCache?> getImageMetadata(
+    String filePath,
+    int modifiedTimeMs,
+  ) async {
+    if (_db == null) return null;
+    final rows = await _db!.query(
+      'image_metadata',
+      where: 'file_path = ? AND modified_time = ?',
+      whereArgs: [filePath, modifiedTimeMs],
+      limit: 1,
+    );
+    if (rows.isEmpty) return null;
+    return ImageMetadataCache.fromMap(rows.first);
+  }
+
+  /// 批量查询图片元数据
+  Future<Map<String, ImageMetadataCache>> getImageMetadataBatch(
+    List<String> filePaths,
+  ) async {
+    if (_db == null || filePaths.isEmpty) return {};
+    final placeholders = filePaths.map((_) => '?').join(',');
+    final rows = await _db!.rawQuery(
+      'SELECT * FROM image_metadata WHERE file_path IN ($placeholders)',
+      filePaths,
+    );
+    return {
+      for (final row in rows)
+        row['file_path'] as String: ImageMetadataCache.fromMap(row)
+    };
+  }
+
+  /// 保存图片元数据
+  Future<void> saveImageMetadata(ImageMetadataCache meta) async {
+    if (_db == null) return;
+    await _db!.insert(
+      'image_metadata',
+      meta.toMap(),
+      conflictAlgorithm: ConflictAlgorithm.replace,
+    );
+  }
+
+  /// 批量保存图片元数据
+  Future<void> saveImageMetadataBatch(List<ImageMetadataCache> metas) async {
+    if (_db == null || metas.isEmpty) return;
+    final batch = _db!.batch();
+    for (final meta in metas) {
+      batch.insert(
+        'image_metadata',
+        meta.toMap(),
+        conflictAlgorithm: ConflictAlgorithm.replace,
+      );
+    }
+    await batch.commit(noResult: true);
+  }
+
+  /// 分页查询图片元数据（按 modified_time 倒序）
+  Future<List<ImageMetadataCache>> getImageMetadataPage({
+    required int limit,
+    required int offset,
+  }) async {
+    if (_db == null) return [];
+    final rows = await _db!.query(
+      'image_metadata',
+      orderBy: 'modified_time DESC',
+      limit: limit,
+      offset: offset,
+    );
+    return rows.map(ImageMetadataCache.fromMap).toList();
+  }
+
+  /// 查询数据库中图片总数
+  Future<int> getImageMetadataCount() async {
+    if (_db == null) return 0;
+    final result = await _db!.rawQuery(
+      'SELECT COUNT(*) as cnt FROM image_metadata',
+    );
+    return (result.first['cnt'] as int?) ?? 0;
+  }
+
+  /// 批量删除不存在的文件记录
+  Future<void> deleteImageMetadataBatch(List<String> filePaths) async {
+    if (_db == null || filePaths.isEmpty) return;
+    final placeholders = filePaths.map((_) => '?').join(',');
+    await _db!.rawDelete(
+      'DELETE FROM image_metadata WHERE file_path IN ($placeholders)',
+      filePaths,
+    );
+  }
 }
 
 /// Model for a recent folder entry
@@ -175,4 +295,43 @@ class RecentFolder {
       'image_count': imageCount,
     };
   }
+}
+
+/// 图片元数据缓存模型
+class ImageMetadataCache {
+  final String filePath;
+  final int width;
+  final int height;
+  final int fileSize;
+  final int modifiedTime; // milliseconds since epoch
+  final String format;
+
+  ImageMetadataCache({
+    required this.filePath,
+    required this.width,
+    required this.height,
+    required this.fileSize,
+    required this.modifiedTime,
+    required this.format,
+  });
+
+  factory ImageMetadataCache.fromMap(Map<String, dynamic> map) {
+    return ImageMetadataCache(
+      filePath: map['file_path'] as String,
+      width: map['width'] as int,
+      height: map['height'] as int,
+      fileSize: map['file_size'] as int,
+      modifiedTime: map['modified_time'] as int,
+      format: map['format'] as String,
+    );
+  }
+
+  Map<String, dynamic> toMap() => {
+        'file_path': filePath,
+        'width': width,
+        'height': height,
+        'file_size': fileSize,
+        'modified_time': modifiedTime,
+        'format': format,
+      };
 }

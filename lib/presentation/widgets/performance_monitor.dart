@@ -1,4 +1,5 @@
 import 'dart:ui';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart';
 
@@ -26,7 +27,8 @@ class _PerformanceMonitorState extends State<PerformanceMonitor> {
   double _currentFps = 60.0;
   final List<Duration> _frameTimes = [];
   static const int _sampleSize = 60; // Sample last 60 frames
-  static const double _targetFps = 30.0;
+  // 在 debug 模式下 FPS 本身就低，只在 release 模式下警告
+  static const double _targetFps = kReleaseMode ? 30.0 : 10.0;
 
   @override
   void initState() {

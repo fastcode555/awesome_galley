@@ -1,22 +1,12 @@
+import 'dart:io';
 import 'package:flutter/material.dart';
-import 'package:provider/provider.dart';
-import '../../application/controllers/image_controller.dart';
-import '../../domain/models/image_data.dart';
 import '../../domain/models/image_item.dart';
-import 'visibility_detector.dart';
-import 'error_display.dart';
 
-/// Lazy loading image widget with visibility detection
+/// 本地图片懒加载组件
 /// 
-/// Features:
-/// - Only loads images when visible in viewport
-/// - Preloads images slightly before they become visible
-/// - Releases memory when images scroll out of view
-/// - Shows placeholder while loading
-/// - Handles errors gracefully
-/// 
-/// Requirements: 9.1, 9.5
-class LazyImageLoader extends StatefulWidget {
+/// 使用 Image.file + cacheWidth 限制解码分辨率，减少内存占用
+/// Flutter 的 ImageCache 自动处理内存缓存
+class LazyImageLoader extends StatelessWidget {
   final ImageItem item;
   final double aspectRatio;
   final BorderRadius? borderRadius;
@@ -29,164 +19,52 @@ class LazyImageLoader extends StatefulWidget {
   });
 
   @override
-  State<LazyImageLoader> createState() => _LazyImageLoaderState();
+  Widget build(BuildContext context) {
+    return AspectRatio(
+      aspectRatio: aspectRatio.isFinite && aspectRatio > 0 ? aspectRatio : 1.0,
+      child: ClipRRect(
+        borderRadius: borderRadius ?? BorderRadius.zero,
+        child: _LocalCachedImage(filePath: item.filePath),
+      ),
+    );
+  }
 }
 
-class _LazyImageLoaderState extends State<LazyImageLoader> {
-  ImageData? _imageData;
-  bool _isLoading = false;
-  bool _hasError = false;
-  bool _isVisible = false;
-  int _retryCount = 0;
-  static const int _maxRetries = 3;
+/// 本地文件图片，带缓存
+class _LocalCachedImage extends StatelessWidget {
+  final String filePath;
 
-  @override
-  void dispose() {
-    // Release image data when widget is disposed
-    _releaseImage();
-    super.dispose();
-  }
-
-  /// Handle visibility changes
-  void _onVisibilityChanged(bool isVisible) {
-    if (!mounted) return;
-
-    setState(() {
-      _isVisible = isVisible;
-    });
-
-    if (isVisible && _imageData == null && !_isLoading && !_hasError) {
-      // Image became visible and not loaded yet - load it
-      _loadImage();
-    } else if (!isVisible && _imageData != null) {
-      // Image scrolled out of view - release memory after a delay
-      Future.delayed(const Duration(seconds: 2), () {
-        if (!mounted || _isVisible) return;
-        _releaseImage();
-      });
-    }
-  }
-
-  /// Load the thumbnail image
-  Future<void> _loadImage() async {
-    if (_isLoading || !mounted) return;
-
-    setState(() {
-      _isLoading = true;
-      _hasError = false;
-    });
-
-    try {
-      final controller = context.read<ImageController>();
-      final imageData = await controller.loadThumbnail(widget.item);
-
-      if (mounted) {
-        setState(() {
-          _imageData = imageData;
-          _isLoading = false;
-          _retryCount = 0; // Reset retry count on success
-        });
-      }
-    } catch (e) {
-      if (mounted) {
-        setState(() {
-          _hasError = true;
-          _isLoading = false;
-        });
-      }
-    }
-  }
-
-  /// Retry loading the image
-  /// 
-  /// Requirement: 10.3 - Provide retry option on timeout
-  Future<void> _retryLoad() async {
-    if (_retryCount >= _maxRetries) {
-      // Max retries reached, show permanent error
-      return;
-    }
-
-    _retryCount++;
-    await _loadImage();
-  }
-
-  /// Release image data to free memory
-  void _releaseImage() {
-    if (_imageData != null) {
-      setState(() {
-        _imageData = null;
-      });
-    }
-  }
+  const _LocalCachedImage({required this.filePath});
 
   @override
   Widget build(BuildContext context) {
-    return VisibilityDetector(
-      onVisibilityChanged: _onVisibilityChanged,
-      visibilityThreshold: 0.5, // Preload when 50% of viewport away
-      child: AspectRatio(
-        aspectRatio: widget.aspectRatio,
-        child: Container(
-          decoration: BoxDecoration(
-            color: Colors.grey[300],
-            borderRadius: widget.borderRadius,
-          ),
-          child: ClipRRect(
-            borderRadius: widget.borderRadius ?? BorderRadius.zero,
-            child: _buildContent(),
-          ),
-        ),
-      ),
+    return Image.file(
+      File(filePath),
+      fit: BoxFit.cover,
+      cacheWidth: 400, // 限制解码宽度，大幅减少内存占用
+      frameBuilder: (context, child, frame, wasSynchronouslyLoaded) {
+        if (wasSynchronouslyLoaded || frame != null) return child;
+        return _placeholder();
+      },
+      errorBuilder: (context, error, stackTrace) => _errorWidget(),
     );
   }
 
-  Widget _buildContent() {
-    if (_hasError) {
-      return _buildErrorPlaceholder();
-    }
-
-    if (_imageData != null) {
-      return Image.memory(
-        _imageData!.bytes,
-        fit: BoxFit.cover,
-        gaplessPlayback: true,
-      );
-    }
-
-    if (_isLoading) {
-      return _buildLoadingPlaceholder();
-    }
-
-    return _buildPlaceholder();
-  }
-
-  Widget _buildPlaceholder() {
+  Widget _placeholder() {
     return Container(
-      color: Colors.grey[300],
+      color: Colors.grey[200],
       child: const Center(
-        child: Icon(Icons.image, size: 48, color: Colors.grey),
+        child: Icon(Icons.image_outlined, size: 32, color: Colors.grey),
       ),
     );
   }
 
-  Widget _buildLoadingPlaceholder() {
+  Widget _errorWidget() {
     return Container(
-      color: Colors.grey[300],
+      color: Colors.grey[200],
       child: const Center(
-        child: SizedBox(
-          width: 24,
-          height: 24,
-          child: CircularProgressIndicator(strokeWidth: 2),
-        ),
+        child: Icon(Icons.broken_image_outlined, size: 32, color: Colors.grey),
       ),
-    );
-  }
-
-  Widget _buildErrorPlaceholder() {
-    return CompactErrorDisplay(
-      type: ErrorType.corrupted,
-      onRetry: _retryCount < _maxRetries ? _retryLoad : null,
-      size: 48.0,
     );
   }
 }

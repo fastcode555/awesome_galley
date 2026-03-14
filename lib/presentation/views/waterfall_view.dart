@@ -1,25 +1,16 @@
+import 'dart:async';
+import 'dart:io';
 import 'package:flutter/material.dart';
+import 'package:flutter_staggered_grid_view/flutter_staggered_grid_view.dart';
 import 'package:provider/provider.dart';
 import '../../application/controllers/gallery_controller.dart';
 import '../../application/managers/mode_manager.dart';
 import '../../domain/models/image_item.dart';
-import '../../infrastructure/cache/cache_preloader.dart';
-import '../widgets/optimized_image_item.dart';
-import '../widgets/performance_monitor.dart';
-import '../widgets/scroll_performance_optimizer.dart';
+import '../utils/responsive_layout.dart';
 import '../widgets/error_display.dart';
 import '../widgets/unified_loading_indicator.dart';
-import '../utils/responsive_layout.dart';
 import 'single_image_viewer.dart';
 
-/// Waterfall layout view for displaying image gallery
-/// 
-/// Displays images in a multi-column waterfall layout with:
-/// - Responsive column count based on screen width
-/// - Infinite scroll with pagination
-/// - Tap to open single image viewer
-/// 
-/// Requirements: 3.1, 3.2, 3.3, 3.4, 3.5, 3.6, 3.7, 3.8
 class WaterfallView extends StatefulWidget {
   const WaterfallView({super.key});
 
@@ -29,182 +20,165 @@ class WaterfallView extends StatefulWidget {
 
 class _WaterfallViewState extends State<WaterfallView> {
   final ScrollController _scrollController = ScrollController();
-  late final CachePreloader _preloader;
-  bool _isScrolling = false;
+  Timer? _loadMoreDebounce;
 
   @override
   void initState() {
     super.initState();
     _scrollController.addListener(_onScroll);
-    _preloader = CachePreloader();
   }
 
   @override
   void dispose() {
+    _loadMoreDebounce?.cancel();
     _scrollController.dispose();
-    _preloader.cancelAll();
     super.dispose();
   }
 
-  /// Handle scroll events for pagination and preloading
   void _onScroll() {
-    if (_scrollController.position.pixels >=
-        _scrollController.position.maxScrollExtent * 0.8) {
-      // Load more when scrolled to 80% of the content
+    final pos = _scrollController.position;
+    if (pos.pixels < pos.maxScrollExtent * 0.85) return;
+
+    // debounce: only fire once per 300ms
+    _loadMoreDebounce?.cancel();
+    _loadMoreDebounce = Timer(const Duration(milliseconds: 300), () {
       final controller = context.read<GalleryController>();
       if (!controller.isLoading && controller.hasMoreImages) {
         controller.loadMoreImages();
       }
-    }
-
-    // Preload images ahead during scroll
-    if (!_isScrolling) {
-      _preloadAheadImages();
-    }
-  }
-
-  /// Preload images that are about to become visible
-  void _preloadAheadImages() {
-    final controller = context.read<GalleryController>();
-    if (controller.images.isEmpty) return;
-
-    // Calculate approximate current index based on scroll position
-    final scrollPercent = _scrollController.hasClients &&
-            _scrollController.position.maxScrollExtent > 0
-        ? (_scrollController.position.pixels /
-            _scrollController.position.maxScrollExtent).clamp(0.0, 1.0)
-        : 0.0;
-    
-    final currentIndex = (controller.images.length * scrollPercent)
-        .floor()
-        .clamp(0, controller.images.length - 1);
-    
-    // Preload ahead
-    _preloader.preloadThumbnails(controller.images, currentIndex);
-  }
-
-  /// Handle scroll start - pause preloading during active scroll
-  void _onScrollStart() {
-    setState(() {
-      _isScrolling = true;
     });
-    _preloader.cancelAll();
-  }
-
-  /// Handle scroll end - resume preloading
-  void _onScrollEnd() {
-    setState(() {
-      _isScrolling = false;
-    });
-    _preloadAheadImages();
-  }
-
-  /// Calculate column count based on screen width
-  int _calculateColumnCount(double screenWidth) {
-    return ResponsiveLayout.calculateWaterfallColumnsFromWidth(screenWidth);
   }
 
   @override
   Widget build(BuildContext context) {
-    return PerformanceMonitor(
-      showOverlay: false, // Set to true in debug mode to see FPS
-      child: ScrollPerformanceOptimizer(
-        scrollController: _scrollController,
-        onScrollStart: _onScrollStart,
-        onScrollEnd: _onScrollEnd,
-        child: Scaffold(
-          appBar: AppBar(
-            title: const Text('Image Gallery'),
-            actions: [
-              // Mode indicator
-              Consumer<ModeManager>(
-                builder: (context, modeManager, child) {
-                  return Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 16.0),
-                    child: Center(
-                      child: Text(
-                        modeManager.isFileAssociationMode()
-                            ? 'Folder View'
-                            : 'System View',
-                        style: const TextStyle(fontSize: 14),
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Image Gallery'),
+        actions: [
+          Consumer<ModeManager>(
+            builder: (context, modeManager, _) => Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16),
+              child: Center(
+                child: Text(
+                  modeManager.isFileAssociationMode() ? 'Folder View' : 'System View',
+                  style: const TextStyle(fontSize: 14),
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+      body: Consumer<GalleryController>(
+        builder: (context, controller, _) {
+          if (controller.images.isEmpty && controller.isLoading) {
+            return const UnifiedLoadingIndicator(
+              message: 'Loading images...',
+              size: LoadingSize.large,
+            );
+          }
+
+          if (controller.errorMessage != null) {
+            return ErrorDisplay(
+              message: 'Failed to load images',
+              details: controller.errorMessage,
+              onRetry: controller.loadSystemImages,
+              type: ErrorType.general,
+            );
+          }
+
+          if (controller.images.isEmpty) {
+            return const EmptyStateDisplay(
+              message: 'No images found',
+              description: 'Try adding some images to your Pictures folder',
+              icon: Icons.photo_library_outlined,
+            );
+          }
+
+          return LayoutBuilder(
+            builder: (context, constraints) {
+              final cols = ResponsiveLayout.calculateWaterfallColumnsFromWidth(
+                constraints.maxWidth,
+              );
+              return CustomScrollView(
+                controller: _scrollController,
+                // ClampingScrollPhysics avoids the rubber-band overdraw on macOS
+                physics: const ClampingScrollPhysics(),
+                slivers: [
+                  if (controller.isScanning)
+                    SliverToBoxAdapter(child: _ScanningBanner()),
+                  SliverPadding(
+                    padding: const EdgeInsets.all(4),
+                    sliver: SliverMasonryGrid.count(
+                      crossAxisCount: cols,
+                      mainAxisSpacing: 4,
+                      crossAxisSpacing: 4,
+                      childCount: controller.images.length,
+                      itemBuilder: (context, index) {
+                        final item = controller.images[index];
+                        return _GridTile(
+                          key: ValueKey(item.filePath),
+                          item: item,
+                          onTap: () => _openViewer(context, controller.images, index),
+                        );
+                      },
+                    ),
+                  ),
+                  if (controller.isLoading)
+                    const SliverToBoxAdapter(
+                      child: Padding(
+                        padding: EdgeInsets.all(16),
+                        child: UnifiedLoadingIndicator(
+                          message: 'Loading more...',
+                          size: LoadingSize.medium,
+                        ),
                       ),
                     ),
-                  );
-                },
-              ),
-            ],
-          ),
-          body: Consumer<GalleryController>(
-            builder: (context, controller, child) {
-              if (controller.images.isEmpty && controller.isLoading) {
-                return const UnifiedLoadingIndicator(
-                  message: 'Loading images...',
-                  size: LoadingSize.large,
-                );
-              }
-
-              if (controller.errorMessage != null) {
-                return ErrorDisplay(
-                  message: 'Failed to load images',
-                  details: controller.errorMessage,
-                  onRetry: () {
-                    controller.loadSystemImages();
-                  },
-                  type: ErrorType.general,
-                );
-              }
-
-              if (controller.images.isEmpty) {
-                return EmptyStateDisplay(
-                  message: 'No images found',
-                  description: 'Try adding some images to your Pictures folder',
-                  icon: Icons.photo_library_outlined,
-                );
-              }
-
-              return LayoutBuilder(
-                builder: (context, constraints) {
-                  final columnCount = _calculateColumnCount(constraints.maxWidth);
-                  
-                  return CustomScrollView(
-                    controller: _scrollController,
-                    physics: const OptimizedScrollPhysics(),
-                    slivers: [
-                      SliverPadding(
-                        padding: const EdgeInsets.all(8.0),
-                        sliver: SliverWaterfallGrid(
-                          images: controller.images,
-                          columnCount: columnCount,
-                          onImageTap: (image, index) {
-                            Navigator.of(context).push(
-                              MaterialPageRoute(
-                                builder: (context) => SingleImageViewer(
-                                  images: controller.images,
-                                  initialIndex: index,
-                                  onClose: () {
-                                    Navigator.of(context).pop();
-                                  },
-                                ),
-                              ),
-                            );
-                          },
-                        ),
-                      ),
-                      if (controller.isLoading)
-                        SliverToBoxAdapter(
-                          child: Padding(
-                            padding: ResponsiveLayout.getPadding(context),
-                            child: const UnifiedLoadingIndicator(
-                              message: 'Loading more images...',
-                              size: LoadingSize.medium,
-                            ),
-                          ),
-                        ),
-                    ],
-                  );
-                },
+                ],
               );
             },
+          );
+        },
+      ),
+    );
+  }
+
+  void _openViewer(BuildContext context, List<ImageItem> images, int index) {
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => SingleImageViewer(
+          images: images,
+          initialIndex: index,
+          onClose: () => Navigator.of(context).pop(),
+        ),
+      ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Grid tile - kept as simple as possible to minimise raster work per frame
+// ---------------------------------------------------------------------------
+
+class _GridTile extends StatelessWidget {
+  final ImageItem item;
+  final VoidCallback onTap;
+
+  const _GridTile({super.key, required this.item, required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    final ratio = (item.width > 0 && item.height > 0)
+        ? item.width / item.height
+        : 1.0;
+
+    return RepaintBoundary(
+      child: GestureDetector(
+        onTap: onTap,
+        child: ClipRRect(
+          borderRadius: BorderRadius.circular(6),
+          child: AspectRatio(
+            aspectRatio: ratio,
+            child: _ThumbnailImage(filePath: item.filePath),
           ),
         ),
       ),
@@ -212,88 +186,89 @@ class _WaterfallViewState extends State<WaterfallView> {
   }
 }
 
-/// Custom sliver for waterfall grid layout
-class SliverWaterfallGrid extends StatelessWidget {
-  final List<ImageItem> images;
-  final int columnCount;
-  final Function(ImageItem, int) onImageTap;
+// ---------------------------------------------------------------------------
+// Thumbnail image - uses ScrollAwareImageProvider to skip decoding while
+// the list is flinging, then loads once the scroll settles.
+// ---------------------------------------------------------------------------
 
-  const SliverWaterfallGrid({
-    super.key,
-    required this.images,
-    required this.columnCount,
-    required this.onImageTap,
-  });
+class _ThumbnailImage extends StatefulWidget {
+  final String filePath;
+  const _ThumbnailImage({required this.filePath});
+
+  @override
+  State<_ThumbnailImage> createState() => _ThumbnailImageState();
+}
+
+class _ThumbnailImageState extends State<_ThumbnailImage>
+    with AutomaticKeepAliveClientMixin {
+  @override
+  bool get wantKeepAlive => true;
+
+  late final DisposableBuildContext<State<StatefulWidget>> _disposableContext;
+
+  @override
+  void initState() {
+    super.initState();
+    _disposableContext = DisposableBuildContext(this);
+  }
+
+  @override
+  void dispose() {
+    _disposableContext.dispose();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
-    // Calculate layout
-    final columns = _calculateWaterfallLayout();
+    super.build(context);
+    final provider = ResizeImage(
+      FileImage(File(widget.filePath)),
+      width: 400,
+      policy: ResizeImagePolicy.fit,
+    );
+    final scrollAware = ScrollAwareImageProvider(
+      context: _disposableContext,
+      imageProvider: provider,
+    );
 
-    return SliverToBoxAdapter(
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: List.generate(columnCount, (columnIndex) {
-          return Expanded(
-            child: Column(
-              children: columns[columnIndex].map((item) {
-                final index = images.indexOf(item);
-                return RepaintBoundary(
-                  child: Padding(
-                    padding: const EdgeInsets.all(4.0),
-                    child: GestureDetector(
-                      onTap: () => onImageTap(item, index),
-                      child: _WaterfallImageItem(item: item),
-                    ),
-                  ),
-                );
-              }).toList(),
-            ),
-          );
-        }),
+    return Image(
+      image: scrollAware,
+      fit: BoxFit.cover,
+      frameBuilder: (ctx, child, frame, wasSynchronous) {
+        if (wasSynchronous || frame != null) return child;
+        return ColoredBox(color: Colors.grey.shade200);
+      },
+      errorBuilder: (_, __, ___) => ColoredBox(
+        color: Colors.grey.shade300,
+        child: const Icon(Icons.broken_image_outlined, color: Colors.grey),
       ),
     );
   }
-
-  /// Calculate waterfall layout by distributing images to shortest column
-  List<List<ImageItem>> _calculateWaterfallLayout() {
-    final columns = List.generate(columnCount, (_) => <ImageItem>[]);
-    final columnHeights = List.filled(columnCount, 0.0);
-
-    for (final image in images) {
-      // Find shortest column
-      int shortestIndex = 0;
-      double minHeight = columnHeights[0];
-      
-      for (int i = 1; i < columnCount; i++) {
-        if (columnHeights[i] < minHeight) {
-          minHeight = columnHeights[i];
-          shortestIndex = i;
-        }
-      }
-
-      // Add image to shortest column
-      columns[shortestIndex].add(image);
-      
-      // Update column height (using aspect ratio)
-      columnHeights[shortestIndex] += 1.0 / image.aspectRatio;
-    }
-
-    return columns;
-  }
 }
 
-/// Individual image item in waterfall grid with lazy loading
-class _WaterfallImageItem extends StatelessWidget {
-  final ImageItem item;
+// ---------------------------------------------------------------------------
+// Scanning banner
+// ---------------------------------------------------------------------------
 
-  const _WaterfallImageItem({required this.item});
-
+class _ScanningBanner extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
-    return OptimizedImageItem(
-      item: item,
-      onTap: null, // Tap is handled by parent GestureDetector
+    return Container(
+      color: Colors.blue.shade50,
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+      child: Row(
+        children: [
+          const SizedBox(
+            width: 12, height: 12,
+            child: CircularProgressIndicator(strokeWidth: 2),
+          ),
+          const SizedBox(width: 8),
+          Text(
+            'Scanning for new images...',
+            style: TextStyle(fontSize: 12, color: Colors.blue.shade700),
+          ),
+        ],
+      ),
     );
   }
 }
